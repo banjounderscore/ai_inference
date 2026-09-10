@@ -38,7 +38,6 @@ static void SetError(const std::string& msg) { g_lastError = msg; }
 struct TrtContext
 {
     Ort::Env            env{ ORT_LOGGING_LEVEL_WARNING, "TrtDll" };
-    Ort::SessionOptions sessionOptions;
     Ort::RunOptions     runOpts;  // cached — avoids per-call heap alloc
     Ort::Session*       session     = nullptr;
     Ort::IoBinding*     binding     = nullptr;
@@ -82,6 +81,69 @@ static bool WideToUtf8(const wchar_t* wide, std::string& out)
     return true;
 }
 
+// Builds a session with the TensorRT EP always registered, and the CUDA EP appended
+// only when includeCudaFallback is set. cuDNN's handle creation (needed by the CUDA EP)
+// loads a large precompiled-engine/kernel catalog unconditionally — a big, fixed memory
+// cost paid just by registering the provider, independent of algo-search or workspace
+// settings. CreateContext below only pays that cost if TensorRT-only actually can't
+// build the model.
+static Ort::Session* BuildSession(Ort::Env& env, const void* modelData, size_t modelSize,
+                                   const wchar_t* modelPath, const std::string& cacheDir8,
+                                   const std::string& prefix8, bool includeCudaFallback)
+{
+    Ort::SessionOptions opts;
+
+    OrtTensorRTProviderOptionsV2* trtOpts = nullptr;
+    Ort::ThrowOnError(Ort::GetApi().CreateTensorRTProviderOptions(&trtOpts));
+    const char* keys[] = {
+        "device_id", "trt_fp16_enable",
+        "trt_engine_cache_enable", "trt_engine_cache_path", "trt_engine_cache_prefix",
+        "trt_engine_decryption_enable", "trt_force_sequential_engine_build",
+        "trt_timing_cache_enable", "trt_timing_cache_path",
+        "trt_builder_optimization_level", "trt_max_workspace_size",
+        "trt_dla_enable", "trt_dump_subgraphs", "trt_auxiliary_streams",
+        "trt_cuda_graph_enable"
+    };
+    const char* vals[] = {
+        "0", "1",
+        "1", cacheDir8.c_str(), prefix8.c_str(),
+        "0", "0",
+        "1", cacheDir8.c_str(),
+        "3", "1073741824",
+        "0", "0", "0",
+        "1"
+    };
+    Ort::ThrowOnError(Ort::GetApi().UpdateTensorRTProviderOptions(trtOpts, keys, vals, 15));
+    opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    Ort::ThrowOnError(Ort::GetApi().SessionOptionsAppendExecutionProvider_TensorRT_V2(opts, trtOpts));
+    Ort::GetApi().ReleaseTensorRTProviderOptions(trtOpts);
+
+    if (includeCudaFallback)
+    {
+        OrtCUDAProviderOptionsV2* cudaOpts = nullptr;
+        Ort::ThrowOnError(Ort::GetApi().CreateCUDAProviderOptions(&cudaOpts));
+        const char* ck[] = {
+            "device_id",
+            "cudnn_conv_algo_search", "cudnn_conv_use_max_workspace",
+            "do_copy_in_default_stream", "enable_cuda_graph", "use_tf32"
+        };
+        const char* cv[] = {
+            "0",
+            "DEFAULT", "0",
+            "0", "1", "1"
+        };
+        Ort::ThrowOnError(Ort::GetApi().UpdateCUDAProviderOptions(cudaOpts, ck, cv, 6));
+        Ort::ThrowOnError(Ort::GetApi().SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cudaOpts));
+        Ort::GetApi().ReleaseCUDAProviderOptions(cudaOpts);
+    }
+
+    if (modelData && modelSize > 0)
+        return new Ort::Session(env, modelData, modelSize, opts);
+    else
+        return new Ort::Session(env, modelPath, opts);
+}
+
 static TrtContext* CreateContext(const void*    modelData,
                                  size_t         modelSize,
                                  const wchar_t* modelPath,
@@ -99,54 +161,14 @@ static TrtContext* CreateContext(const void*    modelData,
 
         ctx->inputBytes = (size_t)imageSize * imageSize * 3 * sizeof(float);
 
-        // TRT EP — enable internal CUDA graph for zero-overhead replay
-        OrtTensorRTProviderOptionsV2* trtOpts = nullptr;
-        Ort::ThrowOnError(Ort::GetApi().CreateTensorRTProviderOptions(&trtOpts));
-        const char* keys[] = {
-            "device_id", "trt_fp16_enable",
-            "trt_engine_cache_enable", "trt_engine_cache_path", "trt_engine_cache_prefix",
-            "trt_engine_decryption_enable", "trt_force_sequential_engine_build",
-            "trt_timing_cache_enable", "trt_timing_cache_path",
-            "trt_builder_optimization_level", "trt_max_workspace_size",
-            "trt_dla_enable", "trt_dump_subgraphs", "trt_auxiliary_streams",
-            "trt_cuda_graph_enable"
-        };
-        const char* vals[] = {
-            "0", "1",
-            "1", cacheDir8.c_str(), prefix8.c_str(),
-            "0", "0",
-            "1", cacheDir8.c_str(),
-            "3", "8589934592",
-            "0", "0", "0",
-            "1"
-        };
-        Ort::ThrowOnError(Ort::GetApi().UpdateTensorRTProviderOptions(trtOpts, keys, vals, 15));
-        ctx->sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        ctx->sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-        Ort::ThrowOnError(Ort::GetApi().SessionOptionsAppendExecutionProvider_TensorRT_V2(ctx->sessionOptions, trtOpts));
-        Ort::GetApi().ReleaseTensorRTProviderOptions(trtOpts);
-
-        // CUDA EP fallback — match the performance flags used on the C# CUDA path
-        OrtCUDAProviderOptionsV2* cudaOpts = nullptr;
-        Ort::ThrowOnError(Ort::GetApi().CreateCUDAProviderOptions(&cudaOpts));
-        const char* ck[] = {
-            "device_id",
-            "cudnn_conv_algo_search", "cudnn_conv_use_max_workspace",
-            "do_copy_in_default_stream", "enable_cuda_graph", "use_tf32"
-        };
-        const char* cv[] = {
-            "0",
-            "EXHAUSTIVE", "1",
-            "0", "1", "1"
-        };
-        Ort::ThrowOnError(Ort::GetApi().UpdateCUDAProviderOptions(cudaOpts, ck, cv, 6));
-        Ort::ThrowOnError(Ort::GetApi().SessionOptionsAppendExecutionProvider_CUDA_V2(ctx->sessionOptions, cudaOpts));
-        Ort::GetApi().ReleaseCUDAProviderOptions(cudaOpts);
-
-        if (modelData && modelSize > 0)
-            ctx->session = new Ort::Session(ctx->env, modelData, modelSize, ctx->sessionOptions);
-        else
-            ctx->session = new Ort::Session(ctx->env, modelPath, ctx->sessionOptions);
+        try
+        {
+            ctx->session = BuildSession(ctx->env, modelData, modelSize, modelPath, cacheDir8, prefix8, false);
+        }
+        catch (const std::exception&)
+        {
+            ctx->session = BuildSession(ctx->env, modelData, modelSize, modelPath, cacheDir8, prefix8, true);
+        }
 
         Ort::AllocatorWithDefaultOptions alloc;
         ctx->inputName  = ctx->session->GetInputNameAllocated(0, alloc).get();
