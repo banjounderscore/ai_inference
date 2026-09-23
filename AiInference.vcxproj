@@ -13,7 +13,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
-    <RootNamespace>trt_inference</RootNamespace>
+    <RootNamespace>ai_inference</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <VCProjectVersion>17.0</VCProjectVersion>
   </PropertyGroup>
@@ -33,10 +33,11 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <OrtRoot>$(USERPROFILE)\.nuget\packages\microsoft.ml.onnxruntime.gpu.windows\1.25.1</OrtRoot>
-    <OrtInclude>$(OrtRoot)\buildTransitive\native\include</OrtInclude>
+    <!-- ORT C API headers vendored in-repo (see thirdparty\README.md) so the build doesn't
+         depend on any particular machine's NuGet cache or username. -->
+    <OrtInclude>$(ProjectDir)thirdparty\onnxruntime\include</OrtInclude>
     <DepsDir>$(ProjectDir)dependencies</DepsDir>
-    <TargetName>trt_inference</TargetName>
+    <TargetName>ai_inference</TargetName>
   </PropertyGroup>
   <!-- Output to build/bin -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -54,7 +55,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>TRTDLL_EXPORTS;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>AIDLL_EXPORTS;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(OrtInclude);$(DepsDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
@@ -64,7 +65,10 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <AdditionalLibraryDirectories>$(DepsDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>onnxruntime.lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- No onnxruntime.lib: both onnxruntime.dll (Nvidia) and onnxruntime_directml.dll are
+           loaded dynamically at runtime (see EnsureBackend in AiInference.cpp) so this one
+           binary can switch between them without being import-bound to either. -->
+      <AdditionalDependencies>cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -72,7 +76,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>TRTDLL_EXPORTS;_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>AIDLL_EXPORTS;_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(OrtInclude);$(DepsDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -80,14 +84,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(DepsDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>onnxruntime.lib;cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="TrtInference.cpp" />
+    <ClCompile Include="AiInference.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="TrtInference.h" />
+    <ClInclude Include="AiInference.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
