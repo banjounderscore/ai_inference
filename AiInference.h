@@ -15,6 +15,9 @@ extern "C" {
 
 // Loads from modelData when modelSize > 0, otherwise from modelPath. provider is one of
 // AI_PROVIDER_*. engineCacheDir/cachePrefix are only used by TensorRT (ignored otherwise).
+// deviceId selects the GPU adapter (CUDA/TensorRT: CUDA device ordinal; DirectML: DXGI
+// adapter enumeration index) — pass the index of whichever adapter the caller's D3D device
+// actually uses, since it isn't guaranteed to be 0 on multi-GPU/hybrid-graphics systems.
 // Switching provider *family* (Nvidia CUDA/TensorRT vs DirectML) requires every previous
 // handle to be destroyed first — this dynamically loads a different onnxruntime.dll build
 // for each family, so it can't coexist with a live session from the other one.
@@ -25,6 +28,7 @@ AIDLL_API void* AiCreate(const wchar_t* modelPath,
                          const wchar_t* cachePrefix,
                          int imageSize,
                          int provider,
+                         int deviceId,
                          int* outOutputElements);
 
 // Reads model metadata on a CPU-only session (Nvidia onnxruntime build). Returns UTF-8 JSON

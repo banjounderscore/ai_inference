@@ -170,10 +170,11 @@ static bool WideToUtf8(const wchar_t* wide, std::string& out)
     return true;
 }
 
-static void AppendTensorRT(Ort::SessionOptions& opts, const std::string& cacheDir8, const std::string& prefix8)
+static void AppendTensorRT(Ort::SessionOptions& opts, const std::string& cacheDir8, const std::string& prefix8, int deviceId)
 {
     OrtTensorRTProviderOptionsV2* trtOpts = nullptr;
     Ort::ThrowOnError(Ort::GetApi().CreateTensorRTProviderOptions(&trtOpts));
+    std::string deviceId8 = std::to_string(deviceId);
     const char* keys[] = {
         "device_id", "trt_fp16_enable",
         "trt_engine_cache_enable", "trt_engine_cache_path", "trt_engine_cache_prefix",
@@ -183,12 +184,16 @@ static void AppendTensorRT(Ort::SessionOptions& opts, const std::string& cacheDi
         "trt_dla_enable", "trt_dump_subgraphs", "trt_auxiliary_streams",
         "trt_cuda_graph_enable"
     };
+    // trt_builder_optimization_level 5 (max) — the extra one-time build cost buys real,
+    // permanent runtime latency: level 5 has the builder search harder for the fastest
+    // kernels rather than settling early. Not worth it before a build already taking
+    // 5-10 minutes was already an accepted cost.
     const char* vals[] = {
-        "0", "1",
+        deviceId8.c_str(), "1",
         "1", cacheDir8.c_str(), prefix8.c_str(),
         "0", "0",
         "1", cacheDir8.c_str(),
-        "3", "1073741824",
+        "5", "1073741824",
         "0", "0", "0",
         "1"
     };
@@ -207,13 +212,16 @@ static void AppendTensorRT(Ort::SessionOptions& opts, const std::string& cacheDi
 // cuDNN's HeurMode_t::B and caches the winner per input shape — worth the one-time search cost
 // during the warmup runs below since our input shape is fixed for the life of the session.
 // cudnn_conv_use_max_workspace isn't set — defaults to true, letting cuDNN pick freely.
-static void AppendCuda(Ort::SessionOptions& opts)
+// prefer_nhwc lets tensor cores engage more directly for conv-heavy models (the layout
+// tensor cores actually operate on); cuDNN/ORT transpose around it as needed.
+static void AppendCuda(Ort::SessionOptions& opts, int deviceId)
 {
     OrtCUDAProviderOptionsV2* cudaOpts = nullptr;
     Ort::ThrowOnError(Ort::GetApi().CreateCUDAProviderOptions(&cudaOpts));
-    const char* ck[] = { "device_id", "cudnn_conv_algo_search", "do_copy_in_default_stream", "enable_cuda_graph", "use_tf32" };
-    const char* cv[] = { "0",         "EXHAUSTIVE",             "0",                         "1",                 "1" };
-    Ort::Status st(Ort::GetApi().UpdateCUDAProviderOptions(cudaOpts, ck, cv, 5));
+    std::string deviceId8 = std::to_string(deviceId);
+    const char* ck[] = { "device_id",    "cudnn_conv_algo_search", "do_copy_in_default_stream", "enable_cuda_graph", "use_tf32", "prefer_nhwc" };
+    const char* cv[] = { deviceId8.c_str(), "EXHAUSTIVE",          "0",                          "1",                 "1",        "1" };
+    Ort::Status st(Ort::GetApi().UpdateCUDAProviderOptions(cudaOpts, ck, cv, 6));
     if (st.IsOK())
         st = Ort::Status(Ort::GetApi().SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cudaOpts));
     Ort::GetApi().ReleaseCUDAProviderOptions(cudaOpts);
@@ -222,7 +230,11 @@ static void AppendCuda(Ort::SessionOptions& opts)
 
 // AMD/Intel/any DX12 GPU, via Windows' own DirectML runtime (no vendor SDK required).
 // No engine build/cache step, unlike TensorRT — sessions are ready after the warmup runs.
-static void AppendDirectML(Ort::SessionOptions& opts)
+// deviceId is a DXGI adapter enumeration index, not a CUDA ordinal — the caller is
+// responsible for translating its D3D device's adapter LUID into that index (see
+// AIAimbot.DirectXCapture.cs on the C# side), since DirectML's own docs warn adapter 0 is
+// often not the most performant GPU on hybrid-graphics/multi-GPU systems.
+static void AppendDirectML(Ort::SessionOptions& opts, int deviceId)
 {
     // Required by DirectML: ORT's default memory-pattern/parallel-exec optimizations assume
     // CPU-shaped memory reuse that doesn't hold for the DML allocator.
@@ -232,12 +244,12 @@ static void AppendDirectML(Ort::SessionOptions& opts)
     const OrtDmlApi* dmlApi = nullptr;
     Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dmlApi)));
     if (!dmlApi) throw std::runtime_error("DirectML execution provider API not available in this onnxruntime build");
-    Ort::ThrowOnError(dmlApi->SessionOptionsAppendExecutionProvider_DML(opts, 0));
+    Ort::ThrowOnError(dmlApi->SessionOptionsAppendExecutionProvider_DML(opts, deviceId));
 }
 
 static Ort::Session* BuildSession(Ort::Env& env, const void* modelData, size_t modelSize,
                                    const wchar_t* modelPath, const std::string& cacheDir8,
-                                   const std::string& prefix8, int provider)
+                                   const std::string& prefix8, int provider, int deviceId)
 {
     Ort::SessionOptions opts;
     opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -245,12 +257,12 @@ static Ort::Session* BuildSession(Ort::Env& env, const void* modelData, size_t m
 
     if (provider == AI_PROVIDER_DIRECTML)
     {
-        AppendDirectML(opts);
+        AppendDirectML(opts, deviceId);
     }
     else if (provider == AI_PROVIDER_CUDA)
     {
         opts.SetIntraOpNumThreads(4);
-        AppendCuda(opts);
+        AppendCuda(opts, deviceId);
     }
     else
     {
@@ -260,7 +272,7 @@ static Ort::Session* BuildSession(Ort::Env& env, const void* modelData, size_t m
         // dependency nothing exercises. A model that doesn't fully build under TensorRT now
         // fails AiCreate outright, which the caller already handles by falling back to
         // DirectML at a higher level (see AIAimbot.ModelManagement.cs).
-        AppendTensorRT(opts, cacheDir8, prefix8);
+        AppendTensorRT(opts, cacheDir8, prefix8, deviceId);
     }
 
     if (modelData && modelSize > 0)
@@ -283,7 +295,7 @@ static size_t PickDetectionOutput(Ort::Session& session)
 
 static AiContext* CreateNvidiaContext(const void* modelData, size_t modelSize, const wchar_t* modelPath,
                                       const wchar_t* engineCacheDir, const wchar_t* cachePrefix,
-                                      int imageSize, int provider, int* outOutputElements)
+                                      int imageSize, int provider, int deviceId, int* outOutputElements)
 {
     auto* ctx = new AiContext();
     ctx->backend = provider;
@@ -298,7 +310,7 @@ static AiContext* CreateNvidiaContext(const void* modelData, size_t modelSize, c
 
         ctx->inputBytes = (size_t)imageSize * imageSize * 3 * sizeof(float);
 
-        ctx->session = BuildSession(*ctx->env, modelData, modelSize, modelPath, cacheDir8, prefix8, provider);
+        ctx->session = BuildSession(*ctx->env, modelData, modelSize, modelPath, cacheDir8, prefix8, provider, deviceId);
 
         size_t outIndex = PickDetectionOutput(*ctx->session);
         Ort::AllocatorWithDefaultOptions alloc;
@@ -375,7 +387,7 @@ static AiContext* CreateNvidiaContext(const void* modelData, size_t modelSize, c
 }
 
 static AiContext* CreateDirectMLContext(const void* modelData, size_t modelSize, const wchar_t* modelPath,
-                                        int imageSize, int* outOutputElements)
+                                        int imageSize, int deviceId, int* outOutputElements)
 {
     auto* ctx = new AiContext();
     ctx->backend = AI_PROVIDER_DIRECTML;
@@ -385,7 +397,7 @@ static AiContext* CreateDirectMLContext(const void* modelData, size_t modelSize,
         ctx->runOpts = new Ort::RunOptions();
 
         Ort::SessionOptions opts;
-        AppendDirectML(opts);
+        AppendDirectML(opts, deviceId);
 
         ctx->session = (modelData && modelSize > 0)
             ? new Ort::Session(*ctx->env, modelData, modelSize, opts)
@@ -540,12 +552,12 @@ extern "C"
 
 AIDLL_API void* AiCreate(const wchar_t* modelPath, const uint8_t* modelData, size_t modelSize,
                          const wchar_t* engineCacheDir, const wchar_t* cachePrefix,
-                         int imageSize, int provider, int* outOutputElements)
+                         int imageSize, int provider, int deviceId, int* outOutputElements)
 {
     if (!EnsureBackend(provider)) return nullptr;
     if (provider == AI_PROVIDER_DIRECTML)
-        return CreateDirectMLContext(modelData, modelSize, modelPath, imageSize, outOutputElements);
-    return CreateNvidiaContext(modelData, modelSize, modelPath, engineCacheDir, cachePrefix, imageSize, provider, outOutputElements);
+        return CreateDirectMLContext(modelData, modelSize, modelPath, imageSize, deviceId, outOutputElements);
+    return CreateNvidiaContext(modelData, modelSize, modelPath, engineCacheDir, cachePrefix, imageSize, provider, deviceId, outOutputElements);
 }
 
 AIDLL_API const char* AiInspect(const wchar_t* modelPath, const uint8_t* modelData, size_t modelSize)
