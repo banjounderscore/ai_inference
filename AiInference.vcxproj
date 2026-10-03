@@ -67,8 +67,9 @@
       <AdditionalLibraryDirectories>$(DepsDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- No onnxruntime.lib: both onnxruntime.dll (Nvidia) and onnxruntime_directml.dll are
            loaded dynamically at runtime (see EnsureBackend in AiInference.cpp) so this one
-           binary can switch between them without being import-bound to either. -->
-      <AdditionalDependencies>cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+           binary can switch between them without being import-bound to either. The same goes
+           for cudart64_12.dll (LoadCudaRuntime) — no cudart.lib, so DirectML machines without
+           CUDA can still load this module. -->
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -84,7 +85,6 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(DepsDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

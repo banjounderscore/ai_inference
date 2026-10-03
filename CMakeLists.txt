@@ -29,9 +29,8 @@ target_include_directories(ai_inference PRIVATE
 
 target_link_directories(ai_inference PRIVATE ${DEPS_DIR})
 
-target_link_libraries(ai_inference PRIVATE
-    cudart.lib
-)
+# No cudart.lib: cudart64_12.dll is loaded at runtime (LoadCudaRuntime in AiInference.cpp) only
+# for the Nvidia backend, so the module still loads on machines without the CUDA runtime.
 
 set_target_properties(ai_inference PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"

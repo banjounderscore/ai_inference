@@ -14,28 +14,52 @@
 #include <stdexcept>
 #include <algorithm>
 #include <atomic>
+#include <type_traits>
 
 // CUDA runtime forward declarations (Nvidia backend only)
 typedef int          cudaError_t;
 typedef void*        cudaStream_t;
 typedef enum { cudaMemcpyHostToDevice = 1, cudaMemcpyDeviceToHost = 2 } cudaMemcpyKind;
 
-extern "C" {
-    cudaError_t cudaMalloc(void** devPtr, size_t size);
-    cudaError_t cudaMallocHost(void** ptr, size_t size);
-    cudaError_t cudaFree(void* devPtr);
-    cudaError_t cudaFreeHost(void* ptr);
-    cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream);
-    cudaError_t cudaMemset(void* devPtr, int value, size_t count);
-    cudaError_t cudaStreamCreateWithFlags(cudaStream_t* pStream, unsigned int flags);
-    cudaError_t cudaStreamDestroy(cudaStream_t stream);
-    cudaError_t cudaStreamSynchronize(cudaStream_t stream);
-    cudaError_t cudaDeviceReset(void);
-    const char* cudaGetErrorString(cudaError_t error);
-}
-
 static const cudaError_t  cudaSuccess          = 0;
+static const cudaError_t  cudaErrorNotLoaded   = 1;   // cudaErrorInvalidValue — runtime not loaded
 static const unsigned int cudaStreamNonBlocking = 0x01;
+
+// cudart64_12.dll is resolved at runtime (LoadCudaRuntime, called only when the Nvidia backend
+// is selected) instead of being linked: a static import would make this whole module fail to
+// load (DllNotFound) on machines without the CUDA runtime — i.e. every AMD/Intel/DirectML user.
+// The wrappers keep the cuda* names so the Nvidia code paths below read as plain CUDA calls.
+static HMODULE g_cudaRuntime = nullptr;
+
+struct CudaApi
+{
+    cudaError_t (*Malloc)(void**, size_t);
+    cudaError_t (*MallocHost)(void**, size_t);
+    cudaError_t (*Free)(void*);
+    cudaError_t (*FreeHost)(void*);
+    cudaError_t (*MemcpyAsync)(void*, const void*, size_t, cudaMemcpyKind, cudaStream_t);
+    cudaError_t (*Memset)(void*, int, size_t);
+    cudaError_t (*StreamCreateWithFlags)(cudaStream_t*, unsigned int);
+    cudaError_t (*StreamDestroy)(cudaStream_t);
+    cudaError_t (*StreamSynchronize)(cudaStream_t);
+    cudaError_t (*DeviceReset)(void);
+    const char* (*GetErrorString)(cudaError_t);
+};
+static CudaApi g_cuda = {};
+
+static cudaError_t cudaMalloc(void** p, size_t n)        { return g_cuda.Malloc ? g_cuda.Malloc(p, n) : cudaErrorNotLoaded; }
+static cudaError_t cudaMallocHost(void** p, size_t n)    { return g_cuda.MallocHost ? g_cuda.MallocHost(p, n) : cudaErrorNotLoaded; }
+static cudaError_t cudaFree(void* p)                     { return g_cuda.Free ? g_cuda.Free(p) : cudaErrorNotLoaded; }
+static cudaError_t cudaFreeHost(void* p)                 { return g_cuda.FreeHost ? g_cuda.FreeHost(p) : cudaErrorNotLoaded; }
+static cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n, cudaMemcpyKind k, cudaStream_t st)
+                                                         { return g_cuda.MemcpyAsync ? g_cuda.MemcpyAsync(d, s, n, k, st) : cudaErrorNotLoaded; }
+static cudaError_t cudaMemset(void* p, int v, size_t n)  { return g_cuda.Memset ? g_cuda.Memset(p, v, n) : cudaErrorNotLoaded; }
+static cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned int f)
+                                                         { return g_cuda.StreamCreateWithFlags ? g_cuda.StreamCreateWithFlags(s, f) : cudaErrorNotLoaded; }
+static cudaError_t cudaStreamDestroy(cudaStream_t s)     { return g_cuda.StreamDestroy ? g_cuda.StreamDestroy(s) : cudaErrorNotLoaded; }
+static cudaError_t cudaStreamSynchronize(cudaStream_t s) { return g_cuda.StreamSynchronize ? g_cuda.StreamSynchronize(s) : cudaErrorNotLoaded; }
+static cudaError_t cudaDeviceReset(void)                 { return g_cuda.DeviceReset ? g_cuda.DeviceReset() : cudaErrorNotLoaded; }
+static const char* cudaGetErrorString(cudaError_t e)     { return g_cuda.GetErrorString ? g_cuda.GetErrorString(e) : "CUDA runtime (cudart64_12.dll) is not loaded"; }
 
 static inline cudaError_t cudaMallocF(float** p, size_t n)  { return cudaMalloc(reinterpret_cast<void**>(p), n); }
 static inline cudaError_t cudaMallocHF(float** p, size_t n) { return cudaMallocHost(reinterpret_cast<void**>(p), n); }
@@ -68,6 +92,55 @@ static std::wstring ModuleDirectory()
     return full.substr(0, full.find_last_of(L"\\/"));
 }
 
+static void UnloadCudaRuntime()
+{
+    g_cuda = {};
+    if (g_cudaRuntime)
+    {
+        FreeLibrary(g_cudaRuntime);
+        g_cudaRuntime = nullptr;
+    }
+}
+
+// Same lookup order a static import used to get: next to this module first, then the normal
+// search path (PATH / an installed CUDA toolkit).
+static bool LoadCudaRuntime()
+{
+    if (g_cudaRuntime) return true;
+
+    g_cudaRuntime = LoadLibraryW((ModuleDirectory() + L"\\cudart64_12.dll").c_str());
+    if (!g_cudaRuntime) g_cudaRuntime = LoadLibraryW(L"cudart64_12.dll");
+    if (!g_cudaRuntime)
+    {
+        SetError("Failed to load cudart64_12.dll (required for CUDA/TensorRT)");
+        return false;
+    }
+
+    bool ok = true;
+    auto resolve = [&](auto& fn, const char* name) {
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(GetProcAddress(g_cudaRuntime, name));
+        if (!fn) ok = false;
+    };
+    resolve(g_cuda.Malloc,                "cudaMalloc");
+    resolve(g_cuda.MallocHost,            "cudaMallocHost");
+    resolve(g_cuda.Free,                  "cudaFree");
+    resolve(g_cuda.FreeHost,              "cudaFreeHost");
+    resolve(g_cuda.MemcpyAsync,           "cudaMemcpyAsync");
+    resolve(g_cuda.Memset,                "cudaMemset");
+    resolve(g_cuda.StreamCreateWithFlags, "cudaStreamCreateWithFlags");
+    resolve(g_cuda.StreamDestroy,         "cudaStreamDestroy");
+    resolve(g_cuda.StreamSynchronize,     "cudaStreamSynchronize");
+    resolve(g_cuda.DeviceReset,           "cudaDeviceReset");
+    resolve(g_cuda.GetErrorString,        "cudaGetErrorString");
+    if (!ok)
+    {
+        SetError("cudart64_12.dll is missing expected exports");
+        UnloadCudaRuntime();
+        return false;
+    }
+    return true;
+}
+
 static bool EnsureBackend(int provider)
 {
     Backend needed = (provider == AI_PROVIDER_DIRECTML) ? Backend::DirectML : Backend::Nvidia;
@@ -85,6 +158,9 @@ static bool EnsureBackend(int provider)
         g_ortModule = nullptr;
         g_backend = Backend::None;
     }
+    UnloadCudaRuntime();
+
+    if (needed == Backend::Nvidia && !LoadCudaRuntime()) return false;
 
     const wchar_t* dllNameW = (needed == Backend::DirectML) ? L"onnxruntime_directml.dll" : L"onnxruntime.dll";
     const char*    dllName8 = (needed == Backend::DirectML) ? "onnxruntime_directml.dll" : "onnxruntime.dll";
@@ -562,9 +638,17 @@ AIDLL_API void* AiCreate(const wchar_t* modelPath, const uint8_t* modelData, siz
 
 AIDLL_API const char* AiInspect(const wchar_t* modelPath, const uint8_t* modelData, size_t modelSize)
 {
-    // Nvidia backend's CPU EP is sufficient for reading metadata regardless of which
-    // provider will actually be used to run inference.
-    if (!EnsureBackend(AI_PROVIDER_CUDA)) return nullptr;
+    // Either build's CPU EP is sufficient for reading metadata regardless of which provider
+    // will actually run inference, so don't force a backend the machine may not support:
+    // reuse whichever is already loaded (switching is refused while contexts are live), else
+    // prefer Nvidia (it's what Create will want on an Nvidia machine, avoiding a reload) and
+    // fall back to DirectML when the CUDA runtime isn't there (AMD/Intel).
+    bool backendReady;
+    if (g_backend != Backend::None)
+        backendReady = true;
+    else
+        backendReady = EnsureBackend(AI_PROVIDER_CUDA) || EnsureBackend(AI_PROVIDER_DIRECTML);
+    if (!backendReady) return nullptr;
     try
     {
         Ort::Env env{ ORT_LOGGING_LEVEL_WARNING, "AiInspect" };
@@ -648,6 +732,7 @@ AIDLL_API int AiShutdown()
         FreeLibrary(g_ortModule);
         g_ortModule = nullptr;
     }
+    UnloadCudaRuntime();
     g_backend = Backend::None;
     return 0;
 }
